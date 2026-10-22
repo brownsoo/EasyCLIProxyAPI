@@ -30,6 +30,8 @@ export type QuotaRow = {
   label: string;
   remainingPercent: number | null;
   quotaAvailable?: boolean;
+  /** Limit applies to a subset of models or features rather than the whole account. */
+  scoped?: boolean;
   groupLabel?: string;
   groupDescription?: string;
   windowLabel?: string;
@@ -307,6 +309,7 @@ const codexWindowRows = (value: Record<string, unknown>): QuotaRow[] => {
         ?? (reached && resetAtMs !== undefined ? 0 : null),
       reset: codexResetLabel(raw),
       resetAtMs,
+      ...(prefix ? { scoped: true } : {}),
     };
   }).filter((row): row is QuotaRow => row !== null);
 };
@@ -446,6 +449,7 @@ export const quotaRowsFor = (provider: QuotaProvider, payload: unknown): QuotaRo
           remainingPercent: remainingFromUsedPercent(raw.utilization),
           reset: absoluteResetLabel(raw.resets_at ?? raw.resetsAt),
           resetAtMs: quotaResetFor(raw, ['resets_at', 'resetsAt']),
+          ...(key === 'five_hour' || key === 'seven_day' ? {} : { scoped: true }),
         };
       })
       .filter((row): row is QuotaRow => row !== null);
@@ -454,6 +458,7 @@ export const quotaRowsFor = (provider: QuotaProvider, payload: unknown): QuotaRo
       remainingPercent: remainingFromUsedPercent(fable.percent),
       reset: absoluteResetLabel(fable.resets_at ?? fable.resetsAt),
       resetAtMs: quotaResetFor(fable, ['resets_at', 'resetsAt']),
+      scoped: true,
     });
     const extraUsage = isRecord(value.extra_usage)
       ? value.extra_usage
@@ -476,6 +481,7 @@ export const quotaRowsFor = (provider: QuotaProvider, payload: unknown): QuotaRo
         detail: usedLabel && limitLabel
           ? quotaText('quota.service.usedOf', { used: usedLabel, limit: limitLabel })
           : undefined,
+        scoped: true,
       });
     }
     return rows;

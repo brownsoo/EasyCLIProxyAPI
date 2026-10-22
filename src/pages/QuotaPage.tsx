@@ -3,7 +3,13 @@ import { EmptyState } from '../components/EmptyState';
 import { SegmentedControl } from '../components/SegmentedControl';
 import { Switch } from '../components/Switch';
 import { commitFetchedQuota } from '../services/quotaEnrichment';
-import { syncCredentialQuotaRouting, useQuotaAutoBalance } from '../services/quotaAutoBalance';
+import {
+  applyQuotaRoutingChange,
+  restoreQuotaRoutingOriginals,
+  subscribeQuotaRoutingChanges,
+  syncCredentialQuotaRouting,
+  useQuotaAutoBalance,
+} from '../services/quotaAutoBalance';
 import { ResetCreditExpiries } from '../components/ResetCreditExpiries';
 import { MessageNotice } from '../appNotice';
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -69,9 +75,16 @@ export function QuotaPage() {
   const [autoBalance, setAutoBalance] = useQuotaAutoBalance();
   const querying = Object.values(quotas).some((quota) => quota.status === 'loading');
 
+  useEffect(() => subscribeQuotaRoutingChanges((name, fields) => {
+    setFiles((current) => applyQuotaRoutingChange(current, name, fields));
+  }), []);
+
   const handleToggleAutoBalance = useCallback((enabled: boolean) => {
     setAutoBalance(enabled);
-    if (!enabled) return;
+    if (!enabled) {
+      void restoreQuotaRoutingOriginals().catch((restoreError) => setError(String(restoreError)));
+      return;
+    }
     const snapshot = getQuotaCacheSnapshot();
     files.forEach((file) => {
       const quota = snapshot[quotaKey(file)];
