@@ -12,7 +12,7 @@ import {
 } from '../src/services/quotaAutoBalance';
 import { commitFetchedQuota } from '../src/services/quotaEnrichment';
 import { captureQuotaCacheGeneration, updateQuotaCache } from '../src/services/quotaCache';
-import type { QuotaState } from '../src/services/quotaService';
+import { quotaRowsFor, type QuotaState } from '../src/services/quotaService';
 
 const memoryStorage = () => {
   const values = new Map<string, string>();
@@ -25,15 +25,21 @@ const memoryStorage = () => {
 
 const fakeApi = (stored: Record<string, Record<string, unknown>>) => {
   const patches: Array<Record<string, unknown>> = [];
-  return {
+  const api = {
     patches,
-    get: async (_path: string, query: Record<string, string>) => ({ ...stored[query.name] }),
+    beforeDownload: undefined as undefined | (() => Promise<void>),
+    get: async (path: string, query?: Record<string, string>) => {
+      if (path === '/credentials') return { files: Object.keys(stored).map((name) => ({ name })) };
+      await api.beforeDownload?.();
+      return { ...stored[String(query?.name)] };
+    },
     patch: async (_path: string, body: Record<string, unknown>) => {
       patches.push(body);
       const { name, ...fields } = body;
       Object.assign(stored[String(name)], fields);
     },
   };
+  return api;
 };
 
 const claudeFile = { name: 'claude-test.json', provider: 'claude', auth_index: 'idx-1', source: 'file', priority: 3 };
@@ -117,6 +123,19 @@ describe('quotaAutoBalance', () => {
     expect(target?.bottleneckPercent).toBe(60);
   });
 
+  it('treats the Claude OAuth apps window as account-wide and model windows as scoped', () => {
+    const rows = quotaRowsFor('claude', {
+      five_hour: { utilization: 20 },
+      seven_day: { utilization: 40 },
+      seven_day_oauth_apps: { utilization: 100 },
+      seven_day_opus: { utilization: 100 },
+    });
+    expect(rows.map((row) => Boolean(row.scoped))).toEqual([false, false, false, true]);
+    const target = computeQuotaRoutingTarget({ status: 'success', rows });
+    expect(target?.priority).toBe(AUTO_BALANCE_PRIORITY.critical);
+    expect(target?.bottleneckPercent).toBe(0);
+  });
+
   it('uses the healthiest model group when only grouped limits exist', () => {
     const target = computeQuotaRoutingTarget({
       status: 'success',
@@ -137,6 +156,7 @@ describe('quotaAutoBalance', () => {
   it('reads current values from the stored credential and skips redundant PATCH requests', async () => {
     const stored = { 'claude-test.json': { priority: 0, weight: 70 } as Record<string, unknown> };
     const api = fakeApi(stored);
+    setQuotaAutoBalanceEnabled(true);
     const quota: QuotaState = {
       status: 'success',
       rows: [
@@ -186,16 +206,72 @@ describe('quotaAutoBalance', () => {
     const api = fakeApi(stored);
     const lowQuota: QuotaState = { status: 'success', rows: [{ label: '5h', remainingPercent: 10 }] };
     const healthyQuota: QuotaState = { status: 'success', rows: [{ label: '5h', remainingPercent: 90 }] };
+    setQuotaAutoBalanceEnabled(true);
 
     await syncCredentialQuotaRouting({ ...claudeFile }, lowQuota, api);
     await syncCredentialQuotaRouting({ ...claudeFile }, healthyQuota, api);
     expect(stored['claude-test.json']).toEqual({ priority: 0, weight: 90 });
 
+    setQuotaAutoBalanceEnabled(false);
     await restoreQuotaRoutingOriginals(api);
     expect(stored['claude-test.json']).toEqual({ priority: -10, weight: null });
 
     api.patches.length = 0;
     await restoreQuotaRoutingOriginals(api);
     expect(api.patches).toEqual([]);
+  });
+
+  it('does not re-apply auto values when a sync finishes after auto-balance is turned off', async () => {
+    const stored = { 'claude-test.json': { priority: 7, weight: 3 } as Record<string, unknown> };
+    const api = fakeApi(stored);
+    const healthyQuota: QuotaState = { status: 'success', rows: [{ label: '5h', remainingPercent: 90 }] };
+    setQuotaAutoBalanceEnabled(true);
+    await syncCredentialQuotaRouting({ ...claudeFile }, healthyQuota, api);
+    expect(stored['claude-test.json']).toEqual({ priority: 0, weight: 90 });
+
+    let releaseDownload = () => {};
+    api.beforeDownload = () => new Promise<void>((resolve) => { releaseDownload = resolve; });
+    const lateSync = syncCredentialQuotaRouting({ ...claudeFile },
+      { status: 'success', rows: [{ label: '5h', remainingPercent: 10 }] }, api);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    setQuotaAutoBalanceEnabled(false);
+    api.beforeDownload = undefined;
+    const restore = restoreQuotaRoutingOriginals(api);
+    releaseDownload();
+    await Promise.all([lateSync, restore]);
+
+    expect(stored['claude-test.json']).toEqual({ priority: 7, weight: 3 });
+  });
+
+  it('keeps manual edits made while enabled and forgets deleted credentials on restore', async () => {
+    const stored: Record<string, Record<string, unknown>> = {
+      'claude-test.json': { priority: 3 },
+      'gone.json': { priority: 4 },
+    };
+    const api = fakeApi(stored);
+    const quota: QuotaState = { status: 'success', rows: [{ label: '5h', remainingPercent: 90 }] };
+    setQuotaAutoBalanceEnabled(true);
+    await syncCredentialQuotaRouting({ ...claudeFile }, quota, api);
+    await syncCredentialQuotaRouting({ ...claudeFile, name: 'gone.json' }, quota, api);
+
+    stored['claude-test.json'] = { priority: 50, weight: 200 };
+    delete stored['gone.json'];
+    setQuotaAutoBalanceEnabled(false);
+    api.patches.length = 0;
+    await restoreQuotaRoutingOriginals(api);
+
+    expect(api.patches).toEqual([]);
+    expect(stored['claude-test.json']).toEqual({ priority: 50, weight: 200 });
+    expect(localStorage.getItem('easy-cli-proxy-api.quota-auto-balance.originals')).toBeNull();
+  });
+
+  it('balances credentials whose unrelated metadata would fail settings validation', async () => {
+    const stored = { 'claude-test.json': { priority: 3, headers: { 'x-retry': 3 }, excluded_models: 42 } as Record<string, unknown> };
+    const api = fakeApi(stored);
+    setQuotaAutoBalanceEnabled(true);
+    await syncCredentialQuotaRouting({ ...claudeFile },
+      { status: 'success', rows: [{ label: '5h', remainingPercent: 90 }] }, api);
+    expect(api.patches).toEqual([{ name: 'claude-test.json', priority: 0, weight: 90 }]);
   });
 });

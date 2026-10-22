@@ -1,7 +1,6 @@
 import { useSyncExternalStore } from 'react';
 import { isOAuthCredentialFile, normalizeAuthFilePriorityInput } from './authFiles';
-import { loadAuthFileSettings } from './authFileSettings';
-import { managementApi, readBoolean, readString } from './managementApi';
+import { isRecord, managementApi, readBoolean, readString, responseList } from './managementApi';
 import type { AuthFile, QuotaRow, QuotaState } from './quotaService';
 
 const STORAGE_KEY = 'easy-cli-proxy-api.quota-auto-balance';
@@ -83,13 +82,23 @@ export function applyQuotaRoutingChange<T extends AuthFile>(files: T[], name: st
   return changed ? next : files;
 }
 
-/** Manual priority and weight (raw settings text) captured before auto-balance first changed them. */
-type StoredOriginals = Record<string, { priority: string; weight: string }>;
+/**
+ * Manual priority and weight captured before auto-balance first changed a credential, plus the
+ * values auto-balance last applied so a later manual edit can be told apart from its own writes.
+ */
+type StoredOriginal = QuotaRoutingFields & { applied?: QuotaRoutingFields };
+type StoredOriginals = Record<string, StoredOriginal>;
+
+const isRoutingFields = (value: unknown): value is QuotaRoutingFields => isRecord(value)
+  && typeof value.priority === 'number'
+  && (value.weight === null || typeof value.weight === 'number');
 
 function readOriginals(): StoredOriginals {
   try {
     const parsed: unknown = JSON.parse(localStorage.getItem(ORIGINALS_STORAGE_KEY) ?? '{}');
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as StoredOriginals : {};
+    if (!isRecord(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter(([, value]) => isRoutingFields(value)
+      && ((value as StoredOriginal).applied === undefined || isRoutingFields((value as StoredOriginal).applied)))) as StoredOriginals;
   } catch {
     return {};
   }
@@ -102,6 +111,13 @@ function writeOriginals(originals: StoredOriginals): void {
   } catch {
     // Ignore storage errors in restricted environments.
   }
+}
+
+function updateOriginal(name: string, next: StoredOriginal | undefined): void {
+  const originals = readOriginals();
+  if (next) originals[name] = next;
+  else delete originals[name];
+  writeOriginals(originals);
 }
 
 export type QuotaRoutingTarget = {
@@ -178,26 +194,56 @@ export function computeQuotaRoutingTarget(quota: QuotaState): QuotaRoutingTarget
 }
 
 type BalanceApi = {
-  get: (path: string, query: Record<string, string>) => Promise<unknown>;
+  get: (path: string, query?: Record<string, string>) => Promise<unknown>;
   patch: (path: string, body: Record<string, unknown>) => Promise<unknown>;
 };
 
-const parseWeight = (text: string): number | null => {
-  const trimmed = text.trim();
-  if (!trimmed) return null;
-  const value = Number(trimmed);
-  return Number.isFinite(value) ? Math.max(0, value) : null;
+const parseWeight = (value: unknown): number | null => {
+  const text = typeof value === 'number' || typeof value === 'string' ? String(value).trim() : '';
+  if (!text) return null;
+  const weight = Number(text);
+  return Number.isFinite(weight) ? Math.max(0, weight) : null;
 };
+
+const sameRouting = (left: QuotaRoutingFields, right: QuotaRoutingFields) =>
+  left.priority === right.priority && left.weight === right.weight;
+
+/** Reads only the routing fields, so unrelated malformed metadata never blocks balancing. */
+async function loadRoutingFields(api: BalanceApi, name: string): Promise<QuotaRoutingFields> {
+  let metadata: unknown = await api.get('/credentials/download', { name });
+  if (typeof metadata === 'string') metadata = JSON.parse(metadata);
+  if (!isRecord(metadata)) throw new Error(`Unexpected credential payload for ${name}`);
+  const priority = metadata.priority;
+  return {
+    priority: typeof priority === 'number' || typeof priority === 'string'
+      ? normalizeAuthFilePriorityInput(String(priority)) ?? 0
+      : 0,
+    weight: parseWeight(metadata.weight),
+  };
+}
 
 async function patchRouting(api: BalanceApi, name: string, fields: QuotaRoutingFields): Promise<void> {
   await api.patch('/credentials/fields', { name, ...fields });
   routingChangeListeners.forEach((listener) => listener(name, fields));
 }
 
+/** Sync and restore of one credential run one at a time so a late sync cannot undo a restore. */
+const credentialLocks = new Map<string, Promise<unknown>>();
+
+function withCredentialLock<T>(name: string, task: () => Promise<T>): Promise<T> {
+  const previous = credentialLocks.get(name) ?? Promise.resolve();
+  const run = previous.catch(() => undefined).then(task);
+  const tail = run.catch(() => undefined);
+  credentialLocks.set(name, tail);
+  void tail.then(() => {
+    if (credentialLocks.get(name) === tail) credentialLocks.delete(name);
+  });
+  return run;
+}
+
 /**
  * Apply computed routing priority and weight to an OAuth credential file if changed.
- * The credential list does not carry weight, so current values are read from the stored file,
- * and the manual values are remembered the first time so they can be restored later.
+ * The credential list does not carry weight, so current values are read from the stored file.
  */
 export async function syncCredentialQuotaRouting(
   file: AuthFile,
@@ -213,33 +259,61 @@ export async function syncCredentialQuotaRouting(
   const target = computeQuotaRoutingTarget(quota);
   if (!target) return null;
 
-  const current = await loadAuthFileSettings(name, api);
-  const originals = readOriginals();
-  if (!originals[name]) {
-    writeOriginals({ ...originals, [name]: { priority: current.priority, weight: current.weight } });
-  }
+  return withCredentialLock(name, async () => {
+    if (!getQuotaAutoBalanceEnabled()) return null;
+    const current = await loadRoutingFields(api, name);
+    if (!getQuotaAutoBalanceEnabled()) return null;
 
-  if (normalizeAuthFilePriorityInput(current.priority) === target.priority
-    && parseWeight(current.weight) === target.weight) {
+    const desired = { priority: target.priority, weight: target.weight };
+    const stored = readOriginals()[name];
+    // A value differing from what auto-balance last applied is a newer manual setting.
+    const manual = stored?.applied && sameRouting(current, stored.applied)
+      ? { priority: stored.priority, weight: stored.weight }
+      : current;
+    if (sameRouting(current, desired)) {
+      updateOriginal(name, stored?.applied ? { ...manual, applied: desired } : { ...manual });
+      return target;
+    }
+
+    updateOriginal(name, { ...manual, applied: desired });
+    try {
+      await patchRouting(api, name, desired);
+    } catch (error) {
+      updateOriginal(name, stored);
+      throw error;
+    }
     return target;
-  }
-
-  await patchRouting(api, name, { priority: target.priority, weight: target.weight });
-  return target;
+  });
 }
 
-/** Restore the manual priority and weight of every credential auto-balance changed. */
+/**
+ * Restore the manual priority and weight of every credential auto-balance changed. Credentials
+ * that no longer exist are forgotten, and ones edited by hand since the last sync are left alone.
+ */
 export async function restoreQuotaRoutingOriginals(api: BalanceApi = managementApi): Promise<void> {
+  const originals = readOriginals();
+  if (!Object.keys(originals).length) return;
+  const existing = new Set(responseList(await api.get('/credentials'), 'files').map((file) => readString(file, 'name')));
+
   const failures: unknown[] = [];
-  for (const [name, original] of Object.entries(readOriginals())) {
+  for (const name of Object.keys(originals)) {
+    if (!existing.has(name)) {
+      updateOriginal(name, undefined);
+      continue;
+    }
     try {
-      await patchRouting(api, name, {
-        priority: normalizeAuthFilePriorityInput(original.priority) ?? 0,
-        weight: parseWeight(original.weight),
+      await withCredentialLock(name, async () => {
+        if (getQuotaAutoBalanceEnabled()) return;
+        const stored = readOriginals()[name];
+        if (!stored) return;
+        if (stored.applied) {
+          const current = await loadRoutingFields(api, name);
+          if (sameRouting(current, stored.applied)) {
+            await patchRouting(api, name, { priority: stored.priority, weight: stored.weight });
+          }
+        }
+        updateOriginal(name, undefined);
       });
-      const remaining = readOriginals();
-      delete remaining[name];
-      writeOriginals(remaining);
     } catch (error) {
       failures.push(error);
     }
