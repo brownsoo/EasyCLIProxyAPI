@@ -15,19 +15,44 @@ export const AUTO_BALANCE_PRIORITY = { healthy: 0, low: -5, critical: -10 } as c
 let cachedEnabled: boolean | undefined;
 const listeners = new Set<() => void>();
 
-function readStoredEnabled(): boolean {
+/** Returns undefined when storage is unavailable so the in-memory value stays authoritative. */
+function readStoredEnabled(): boolean | undefined {
   try {
     return localStorage.getItem(STORAGE_KEY) === 'on';
   } catch {
-    return false;
+    return undefined;
   }
 }
 
 export function getQuotaAutoBalanceEnabled(): boolean {
   if (cachedEnabled === undefined) {
-    cachedEnabled = readStoredEnabled();
+    cachedEnabled = readStoredEnabled() ?? false;
   }
   return cachedEnabled;
+}
+
+/** Re-reads the stored toggle, which another tab may have changed, and notifies on change. */
+function refreshQuotaAutoBalanceEnabled(): boolean {
+  const stored = readStoredEnabled();
+  if (stored !== undefined && stored !== getQuotaAutoBalanceEnabled()) {
+    cachedEnabled = stored;
+    listeners.forEach((listener) => listener());
+  }
+  return getQuotaAutoBalanceEnabled();
+}
+
+/** Keeps the toggle in step with other tabs; `key` is null when storage was cleared. */
+export function watchQuotaAutoBalanceStorage(target: Pick<EventTarget, 'addEventListener' | 'removeEventListener'>): () => void {
+  const onStorage = (event: Event) => {
+    const key = (event as Event & { key?: string | null }).key;
+    if (key === STORAGE_KEY || key === null || key === undefined) refreshQuotaAutoBalanceEnabled();
+  };
+  target.addEventListener('storage', onStorage);
+  return () => target.removeEventListener('storage', onStorage);
+}
+
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  watchQuotaAutoBalanceStorage(window);
 }
 
 export function setQuotaAutoBalanceEnabled(enabled: boolean): void {
@@ -260,9 +285,10 @@ export async function syncCredentialQuotaRouting(
   if (!target) return null;
 
   return withCredentialLock(name, async () => {
-    if (!getQuotaAutoBalanceEnabled()) return null;
+    // Read the stored toggle, not just this tab's copy, so another tab turning it off wins.
+    if (!refreshQuotaAutoBalanceEnabled()) return null;
     const current = await loadRoutingFields(api, name);
-    if (!getQuotaAutoBalanceEnabled()) return null;
+    if (!refreshQuotaAutoBalanceEnabled()) return null;
 
     const desired = { priority: target.priority, weight: target.weight };
     const stored = readOriginals()[name];
@@ -303,7 +329,7 @@ export async function restoreQuotaRoutingOriginals(api: BalanceApi = managementA
     }
     try {
       await withCredentialLock(name, async () => {
-        if (getQuotaAutoBalanceEnabled()) return;
+        if (refreshQuotaAutoBalanceEnabled()) return;
         const stored = readOriginals()[name];
         if (!stored) return;
         if (stored.applied) {

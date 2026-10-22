@@ -9,6 +9,7 @@ import {
   setQuotaAutoBalanceEnabled,
   subscribeQuotaRoutingChanges,
   syncCredentialQuotaRouting,
+  watchQuotaAutoBalanceStorage,
 } from '../src/services/quotaAutoBalance';
 import { commitFetchedQuota } from '../src/services/quotaEnrichment';
 import { captureQuotaCacheGeneration, updateQuotaCache } from '../src/services/quotaCache';
@@ -273,5 +274,33 @@ describe('quotaAutoBalance', () => {
     await syncCredentialQuotaRouting({ ...claudeFile },
       { status: 'success', rows: [{ label: '5h', remainingPercent: 90 }] }, api);
     expect(api.patches).toEqual([{ name: 'claude-test.json', priority: 0, weight: 90 }]);
+  });
+
+  it('follows the toggle when another tab changes it', () => {
+    const target = new EventTarget();
+    const unwatch = watchQuotaAutoBalanceStorage(target);
+    setQuotaAutoBalanceEnabled(true);
+
+    localStorage.setItem('easy-cli-proxy-api.quota-auto-balance', 'off');
+    target.dispatchEvent(Object.assign(new Event('storage'), { key: 'easy-cli-proxy-api.quota-auto-balance' }));
+    expect(getQuotaAutoBalanceEnabled()).toBe(false);
+
+    localStorage.setItem('easy-cli-proxy-api.quota-auto-balance', 'on');
+    target.dispatchEvent(Object.assign(new Event('storage'), { key: 'unrelated' }));
+    expect(getQuotaAutoBalanceEnabled()).toBe(false);
+    unwatch();
+  });
+
+  it('skips syncing once another tab has turned auto-balance off', async () => {
+    const stored = { 'claude-test.json': { priority: 7 } as Record<string, unknown> };
+    const api = fakeApi(stored);
+    setQuotaAutoBalanceEnabled(true);
+    localStorage.setItem('easy-cli-proxy-api.quota-auto-balance', 'off');
+
+    await syncCredentialQuotaRouting({ ...claudeFile },
+      { status: 'success', rows: [{ label: '5h', remainingPercent: 90 }] }, api);
+
+    expect(api.patches).toEqual([]);
+    expect(getQuotaAutoBalanceEnabled()).toBe(false);
   });
 });
